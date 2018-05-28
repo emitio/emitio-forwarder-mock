@@ -3,15 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
-	"fmt"
+	"encoding/binary"
+	"math/rand"
 	"os"
 	"time"
+
+	"google.golang.org/grpc/codes"
+
+	"github.com/golang/protobuf/ptypes"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
-	"github.com/emitio/emitio-forwarder-mock/pkg/emitio"
+	"github.com/emitio/emitio-forwarder-mock/pkg/emitio/v1"
 )
 
 func main() {
@@ -37,41 +42,90 @@ func main() {
 	}
 }
 
+func spanID() [8]byte {
+	id := rand.Uint64()
+	var sid [8]byte
+	binary.LittleEndian.PutUint64(sid[:], id)
+	return sid
+}
+
 func runStdinProducer(ctx context.Context, client emitio.EmitIOClient) error {
-	stream, err := client.Emit(ctx)
-	if err != nil {
-		return err
-	}
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		// reader
-		for {
-			output, err := stream.Recv()
-			if err != nil {
-				return err
-			}
-			fmt.Println(output)
-		}
-	})
-	eg.Go(func() error {
-		// writer
-		// send required header first
-		err := stream.Send(&emitio.EmitInput{
-			Inputs: &emitio.EmitInput_Header{
-				Header: &emitio.EmitHeader{
-					Name: "stdin",
-				},
-			},
-		})
-		if err != nil {
-			return err
-		}
-		// send optional metadata
-		err = stream.Send(&emitio.EmitInput{
-			Inputs: &emitio.EmitInput_Meta{
-				Meta: &emitio.EmitMeta{
-					Meta: map[string]string{
-						"environment": "dev",
+	scanner := bufio.NewScanner(os.Stdin) // TODO replace with interruptable io.Reader that will error on ctx close
+	var id uint64
+	for scanner.Scan() {
+		line := scanner.Text()
+		id++
+		sid := spanID()
+		_, err := client.Emit(ctx, &emitio.EmitRequest{
+			Spans: []*emitio.Span{
+				&emitio.Span{
+					SpanId: sid[:],
+					Name: &emitio.TruncatableString{
+						Value: "stdin line received",
+					},
+					EndTime:  ptypes.TimestampNow(),
+					Duration: ptypes.DurationProto(time.Duration(0)),
+					Attributes: &emitio.Span_Attributes{
+						AttributeMap: map[string]*emitio.AttributeValue{
+							"sample.bool.value": &emitio.AttributeValue{
+								Value: &emitio.AttributeValue_BoolValue{
+									BoolValue: true,
+								},
+							},
+							"sample.string.value": &emitio.AttributeValue{
+								Value: &emitio.AttributeValue_StringValue{
+									StringValue: &emitio.TruncatableString{
+										Value: "greetings",
+									},
+								},
+							},
+							"sample.int.value": &emitio.AttributeValue{
+								Value: &emitio.AttributeValue_IntValue{
+									IntValue: -74,
+								},
+							},
+						},
+					},
+					TimeEvents: &emitio.Span_TimeEvents{
+						TimeEvent: []*emitio.Span_TimeEvent{
+							&emitio.Span_TimeEvent{
+								Time: ptypes.TimestampNow(),
+								Value: &emitio.Span_TimeEvent_Annotation_{
+									Annotation: &emitio.Span_TimeEvent_Annotation{
+										Description: &emitio.TruncatableString{
+											Value: "stdin received",
+										},
+										Attributes: &emitio.Span_Attributes{
+											AttributeMap: map[string]*emitio.AttributeValue{
+												"stdin.line.length": &emitio.AttributeValue{
+													Value: &emitio.AttributeValue_IntValue{
+														IntValue: int64(len(line)),
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+							&emitio.Span_TimeEvent{
+								Time: ptypes.TimestampNow(),
+								Value: &emitio.Span_TimeEvent_MessageEvent_{
+									MessageEvent: &emitio.Span_TimeEvent_MessageEvent{
+										Type:             emitio.Span_TimeEvent_MessageEvent_RECEIVED,
+										Id:               id,
+										UncompressedSize: uint64(len(line)),
+									},
+								},
+							},
+						},
+					},
+					Status: &emitio.Status{
+						Code:    int32(codes.OK),
+						Message: "read line from stdin",
+					},
+					Severity: emitio.Span_DEBUG,
+					Unstructured: &emitio.TruncatableString{
+						Value: line,
 					},
 				},
 			},
@@ -79,12 +133,60 @@ func runStdinProducer(ctx context.Context, client emitio.EmitIOClient) error {
 		if err != nil {
 			return err
 		}
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			err := stream.Send(&emitio.EmitInput{
-				Inputs: &emitio.EmitInput_Body{
-					Body: &emitio.EmitBody{
-						Body: scanner.Bytes(),
+	}
+	err := scanner.Err()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func runTickerProducer(ctx context.Context, client emitio.EmitIOClient) error {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	var id uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			id++
+			sid := spanID()
+			_, err := client.Emit(ctx, &emitio.EmitRequest{
+				Spans: []*emitio.Span{
+					&emitio.Span{
+						SpanId: sid[:],
+						Name: &emitio.TruncatableString{
+							Value: "ticker value produced",
+						},
+						EndTime:  ptypes.TimestampNow(),
+						Duration: ptypes.DurationProto(time.Duration(0)),
+						Attributes: &emitio.Span_Attributes{
+							AttributeMap: map[string]*emitio.AttributeValue{
+								"sample.bool.value": &emitio.AttributeValue{
+									Value: &emitio.AttributeValue_BoolValue{
+										BoolValue: true,
+									},
+								},
+								"sample.string.value": &emitio.AttributeValue{
+									Value: &emitio.AttributeValue_StringValue{
+										StringValue: &emitio.TruncatableString{
+											Value: "greetings",
+										},
+									},
+								},
+								"sample.int.value": &emitio.AttributeValue{
+									Value: &emitio.AttributeValue_IntValue{
+										IntValue: -74,
+									},
+								},
+							},
+						},
+						Status: &emitio.Status{
+							Code:    int32(codes.OK),
+							Message: "read line from stdin",
+						},
+						Severity: emitio.Span_DEBUG,
 					},
 				},
 			})
@@ -92,77 +194,5 @@ func runStdinProducer(ctx context.Context, client emitio.EmitIOClient) error {
 				return err
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			return err
-		}
-		return nil
-	})
-	return eg.Wait()
-}
-
-func runTickerProducer(ctx context.Context, client emitio.EmitIOClient) error {
-	stream, err := client.Emit(ctx)
-	if err != nil {
-		return err
 	}
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		// reader
-		for {
-			output, err := stream.Recv()
-			if err != nil {
-				return err
-			}
-			fmt.Println(output)
-		}
-	})
-	eg.Go(func() error {
-		const period = time.Second
-		t := time.NewTicker(period)
-		defer t.Stop()
-		// writer
-		// send required header first
-		err := stream.Send(&emitio.EmitInput{
-			Inputs: &emitio.EmitInput_Header{
-				Header: &emitio.EmitHeader{
-					Name: "ticker",
-				},
-			},
-		})
-		if err != nil {
-			return err
-		}
-		// send optional metadata
-		err = stream.Send(&emitio.EmitInput{
-			Inputs: &emitio.EmitInput_Meta{
-				Meta: &emitio.EmitMeta{
-					Meta: map[string]string{
-						"environment": "dev",
-						"period":      fmt.Sprintf("%s", period),
-					},
-				},
-			},
-		})
-		if err != nil {
-			return err
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case at := <-t.C:
-				err := stream.Send(&emitio.EmitInput{
-					Inputs: &emitio.EmitInput_Body{
-						Body: &emitio.EmitBody{
-							Body: []byte(fmt.Sprintf("hello from a message generated at %s", at)),
-						},
-					},
-				})
-				if err != nil {
-					return err
-				}
-			}
-		}
-	})
-	return eg.Wait()
 }
