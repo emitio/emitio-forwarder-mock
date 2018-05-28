@@ -23,7 +23,8 @@ func main() {
 	ctx := context.Background()
 	l, _ := zap.NewDevelopment()
 	zap.ReplaceGlobals(l)
-	const target = "unix:/var/run/emitio/emitio.sock"
+	const target = "127.0.0.1:3648"
+	zap.L().With(zap.String("target", target)).Info("dialing")
 	conn, err := grpc.DialContext(ctx, target, grpc.WithInsecure())
 	if err != nil {
 		zap.L().With(zap.Error(err)).With(zap.String("target", target)).Fatal("dialing grpc")
